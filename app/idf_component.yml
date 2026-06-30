@@ -1,9 +1,9 @@
 # Component manifest for the "Yapp" device app (direct Todoist).
-# No third-party managed deps yet; the direct-Todoist fetch (step 11) will add
-# esp_http_client/esp-tls (IDF components, satisfied by the build). taskmaster_core
-# is a local component in the firmware build, so it's a plain CMake REQUIRES — not
-# a git dependency here.
+# taskmaster_core is provided locally by the firmware build (plain CMake REQUIRES).
+# cJSON isn't bundled in IDF v6, so pull it from the component registry.
 version: "0.1.0"
 description: "TaskMaster-C3 'Yapp' task source app (direct Todoist)"
 targets:
   - esp32c3
+dependencies:
+  espressif/cjson: "^1.7"
