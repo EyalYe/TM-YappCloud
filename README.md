@@ -1,42 +1,42 @@
-# yappcloud — a TaskMaster-C3 "Yapp" source (Todoist)
+# yappcloud — a TaskMaster-C3 "Yapp" source (direct Todoist)
 
-A self-contained **task source** for [TaskMaster-C3](https://github.com/EyalYe/TaskMaster):
-a host server that maps the device REST contract onto **Todoist**, reusing the
-existing [`yapp-cli`](../yapp-cli) code (`get_api` + the paginator/priority
-handling from `todolst.py`). The device speaks only the contract; this proxy
-hides every Todoist-library quirk server-side. It's the `todomark`-on-hardware
-experience.
+The "Yapp" task source for [TaskMaster-C3](https://github.com/EyalYe/TaskMaster):
+the device app talks **directly to Todoist** over HTTPS — **no host server / proxy
+to run**. It's the `todomark`-on-hardware experience, served straight from the
+cloud.
 
-This repo is one half of a **source product**: the host server (here) plus the
-device app component (added under `app/` once the TaskMaster Task Manager lands).
-Keeping it in its own repo means core and app development stay independent — the
-device's stable app API + REST contract are the only coupling.
+This repo holds the **device app component only** (under `app/`, added with the
+Task Manager work). It depends only on the stable TaskMaster app API + the
+generic UI/async facilities core provides (core ⟂ userspace). Tasks themselves are
+userspace: this app fetches Todoist's JSON over `esp_http_client` + `esp-tls`
+(`esp_crt_bundle` for the cert chain), parses it into the shared `task_t` model,
+and renders via core's generic list widget.
 
-## The contract
+## How it talks to Todoist
 
 ```
-GET  /tasks                      -> { "etag", "tasks":[ {id, parent_id, title,
-                                      due, priority(1..4, 4=highest), done}, ... ] }
-POST /tasks/{id}/complete        -> close the Todoist task
-POST /tasks/{id}/postpone {due}  -> reschedule (due string, e.g. "tomorrow")
-GET  /health                     -> { "ok": true }   (no token needed)
+GET  https://api.todoist.com/rest/v2/tasks      (Bearer <token>)   -> active tasks
+POST https://api.todoist.com/rest/v2/tasks/{id}/close              -> complete
+POST https://api.todoist.com/rest/v2/tasks/{id}  { due_string }    -> postpone
 ```
 
-## Setup & run
+The **Todoist token** is the app's declared config (`TASKMASTER_REGISTER_APP_CONFIG`,
+a paste field in the device's setup form) — never hardcoded, never in core.
 
-Needs a Todoist token. The proxy reuses `~/yapp-cli/.env` (override the scripts
-path with `YAPP_CLI_SCRIPTS`).
+## Install on the device
 
-```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python server.py --port 8080
+Add it to a TaskMaster firmware build's `main/idf_component.yml`:
+
+```yaml
+dependencies:
+  tm_yapp:
+    git: git@github.com:EyalYe/TM-YappCloud.git
+    path: app
 ```
 
-Then point the device's "Yapp" source URL at `http://<this-machine-ip>:8080`.
+The app self-registers; configure your Todoist token via the device's Wi-Fi setup
+form. No server, no LAN box — just the device and Todoist.
 
-## Verify
-
-```bash
-curl localhost:8080/health        # works without a token
-curl localhost:8080/tasks         # your real Todoist tasks, in contract shape
-```
+> The earlier `yapp_server` proxy was **dropped**: the device reaches Todoist
+> directly, so there's nothing to host. (The LAN-box approach still exists as a
+> separate source — see `yapplocal`.)

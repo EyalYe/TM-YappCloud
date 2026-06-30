@@ -1,2 +1,0 @@
-todoist-api-python>=2.1.0   # talks to Todoist (reused by yapp-cli too)
-python-dotenv>=1.0.0        # loads the token from ~/yapp-cli/.env
