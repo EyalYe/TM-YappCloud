@@ -36,7 +36,7 @@ static const char *TAG = "app.yapp";
 #define YAPP_TOKEN_MAX    64
 #define YAPP_BODY_MAX     32768   /* hard cap on the Todoist response */
 #define YAPP_HTTP_TMO_MS  15000   /* HTTPS is slower than LAN */
-#define YAPP_API_TASKS    "https://api.todoist.com/rest/v2/tasks"
+#define YAPP_API_TASKS    "https://api.todoist.com/api/v1/tasks"   /* unified v1 (rest/v2 retired) */
 
 static const control_hints_t YAPP_HINTS = { .rotate = "<>", .click = "SYN", .select = "DON" };
 
@@ -72,14 +72,20 @@ static void copy_field(char *dst, cJSON *obj, const char *key, size_t dst_sz)
     }
 }
 
-/* Todoist returns a BARE array of task objects (not wrapped). Map each:
+/* Todoist v1 returns { "results": [ {task}, ... ], "next_cursor": ... }. Map each:
  * content→title, priority (1..4, 4=urgent=P1) passes through, due.date→due,
- * parent_id (null→""), is_completed→done. */
+ * parent_id (null→""), checked→done. (Pagination via next_cursor is ignored — we
+ * take the first page, capped at TASK_MAX; fine for small accounts.) */
 static bool parse_todoist(const char *json, fetch_ctx_t *f)
 {
-    cJSON *arr = cJSON_Parse(json);
+    cJSON *root = cJSON_Parse(json);
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return false;
+    }
+    cJSON *arr = cJSON_GetObjectItem(root, "results");
     if (!cJSON_IsArray(arr)) {
-        cJSON_Delete(arr);
+        cJSON_Delete(root);
         return false;
     }
     int n = 0;
@@ -100,9 +106,10 @@ static bool parse_todoist(const char *json, fetch_ctx_t *f)
         }
         cJSON *p = cJSON_GetObjectItem(it, "priority");
         t->priority = cJSON_IsNumber(p) ? (uint8_t)p->valueint : TASK_PRIO_MIN;
+        t->done = cJSON_IsTrue(cJSON_GetObjectItem(it, "checked"));
         n++;
     }
-    cJSON_Delete(arr);
+    cJSON_Delete(root);
     f->count = n;
     return true;
 }
