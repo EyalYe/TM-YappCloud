@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include "ui_list.h"
 #include "ui_frame.h"
+#include "app_store.h"   /* offline cache + write queue persistence (step 12) */
 
 #define TASK_MAX        50   /* cap on tasks held on-device */
 #define TASK_ID_MAX     24   /* id / parent_id string (incl NUL) */
@@ -28,6 +29,14 @@
 #define TASK_PRIO_MAX   4    /* highest (Todoist P1) */
 #define TASK_ROW_MAX    40   /* max chars per rendered row */
 #define TASK_EMPTY_ROW  0
+
+/* ── offline cache + bounded write queue (§8.5 step 12) ── */
+#define TASK_QUEUE_MAX   16        /* max pending writes (completes) held offline */
+#define TASK_BANNER_ROWS 1         /* rows the OFFLINE banner steals from the list */
+#define TASK_OFFLINE_ROW 0         /* banner row */
+#define TASK_CACHE_KEY   "cache"   /* NVS blob: the cached task_t[] */
+#define TASK_CACHE_N_KEY "cachen"  /* NVS u32:  cached task count */
+#define TASK_QUEUE_KEY   "wrq"     /* NVS blob: the write queue */
 
 typedef struct {
     char    id[TASK_ID_MAX];
@@ -87,5 +96,86 @@ static inline void task_view_render(task_view_t *v)
         ui_text_row(TASK_EMPTY_ROW, "No open tasks");
         return;
     }
+    /* Full window (restores it after an offline render shrank it by the banner). */
+    ui_list_set_rows(&v->list, UI_ROWS);
     ui_list_draw(&v->list, 0, task_row_text, v);
+}
+
+/* ── offline cache (NVS blob, written on exit, loaded on init) ── */
+
+/* Persist the current view so it shows even offline / after a reboot (§8.5 step 12).
+ * Called on app exit (not per-sync) to bound flash wear. */
+static inline void task_cache_save(app_store_t *st, const task_view_t *v)
+{
+    app_store_set_u32(st, TASK_CACHE_N_KEY, (uint32_t)v->count);
+    if (v->count > 0) {
+        app_store_set_blob(st, TASK_CACHE_KEY, v->items,
+                           (size_t)v->count * sizeof(task_t));
+    }
+}
+
+/* Load the cached view (no-op when nothing is stored). */
+static inline void task_cache_load(app_store_t *st, task_view_t *v)
+{
+    uint32_t n = 0;
+    app_store_get_u32(st, TASK_CACHE_N_KEY, &n, 0);
+    if (n > TASK_MAX) n = TASK_MAX;
+    if (n == 0) return;
+    size_t len = (size_t)n * sizeof(task_t);
+    if (app_store_get_blob(st, TASK_CACHE_KEY, v->items, &len) == 0) {
+        task_view_set_count(v, (int)(len / sizeof(task_t)));
+    }
+}
+
+/* ── bounded write queue: completes done offline, replayed on reconnect ── */
+typedef struct {
+    char ids[TASK_QUEUE_MAX][TASK_ID_MAX];
+    int  n;
+} task_queue_t;
+
+static inline void task_queue_load(app_store_t *st, task_queue_t *q)
+{
+    memset(q, 0, sizeof(*q));
+    size_t len = sizeof(*q);
+    app_store_get_blob(st, TASK_QUEUE_KEY, q, &len);   /* missing key → stays zeroed */
+    if (q->n < 0 || q->n > TASK_QUEUE_MAX) q->n = 0;
+}
+
+static inline void task_queue_save(app_store_t *st, const task_queue_t *q)
+{
+    app_store_set_blob(st, TASK_QUEUE_KEY, q, sizeof(*q));
+}
+
+/* Enqueue a task id; false when the queue is full (the write is then refused). */
+static inline bool task_queue_push(task_queue_t *q, const char *id)
+{
+    if (q->n >= TASK_QUEUE_MAX) return false;
+    strlcpy(q->ids[q->n], id, TASK_ID_MAX);
+    q->n++;
+    return true;
+}
+
+static inline void task_queue_remove(task_queue_t *q, int idx)
+{
+    if (idx < 0 || idx >= q->n) return;
+    for (int i = idx; i < q->n - 1; i++) {
+        memcpy(q->ids[i], q->ids[i + 1], TASK_ID_MAX);
+    }
+    q->n--;
+}
+
+/* Offline render: OFFLINE banner (with queued count) + the cached list below it.
+ * Call after lv_obj_clean(content); the caller picks this path when !net_is_online(). */
+static inline void task_view_render_offline(task_view_t *v, int queued)
+{
+    char banner[TASK_ROW_MAX];
+    if (queued > 0) {
+        snprintf(banner, sizeof(banner), "OFFLINE  %d queued", queued);
+    } else {
+        strlcpy(banner, "OFFLINE", sizeof(banner));
+    }
+    ui_text_row(TASK_OFFLINE_ROW, banner);
+    if (v->count == 0) return;
+    ui_list_set_rows(&v->list, UI_ROWS - TASK_BANNER_ROWS);   /* room for the banner */
+    ui_list_draw(&v->list, TASK_BANNER_ROWS, task_row_text, v);
 }
