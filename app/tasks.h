@@ -32,6 +32,7 @@
 
 /* ── offline cache + bounded write queue (§8.5 step 12) ── */
 #define TASK_QUEUE_MAX   16        /* max pending writes (completes) held offline */
+#define TASK_QUEUE_TRIES 5         /* drop a queued write after this many failed replays (poison guard, step 13) */
 #define TASK_BANNER_ROWS 1         /* rows the OFFLINE banner steals from the list */
 #define TASK_OFFLINE_ROW 0         /* banner row */
 #define TASK_CACHE_KEY   "cache"   /* NVS blob: the cached task_t[] */
@@ -129,8 +130,9 @@ static inline void task_cache_load(app_store_t *st, task_view_t *v)
 
 /* ── bounded write queue: completes done offline, replayed on reconnect ── */
 typedef struct {
-    char ids[TASK_QUEUE_MAX][TASK_ID_MAX];
-    int  n;
+    char    ids[TASK_QUEUE_MAX][TASK_ID_MAX];
+    int     n;
+    uint8_t tries;   /* failed replay attempts on the head entry ids[0] (poison guard) */
 } task_queue_t;
 
 static inline void task_queue_load(app_store_t *st, task_queue_t *q)
@@ -162,6 +164,23 @@ static inline void task_queue_remove(task_queue_t *q, int idx)
         memcpy(q->ids[i], q->ids[i + 1], TASK_ID_MAX);
     }
     q->n--;
+}
+
+/* Drop the head entry (a successful — or poison — replay) and reset its try count. */
+static inline void task_queue_pop_head(task_queue_t *q)
+{
+    if (q->n <= 0) return;
+    task_queue_remove(q, 0);
+    q->tries = 0;   /* the next entry becomes the head */
+}
+
+/* Record a failed replay of the head; returns true when it has failed enough times
+ * to be considered poison and should be dropped (step 13 — prevents a stuck queue). */
+static inline bool task_queue_fail_head(task_queue_t *q)
+{
+    if (q->n <= 0) return false;
+    if (q->tries < 255) q->tries++;
+    return q->tries >= TASK_QUEUE_TRIES;
 }
 
 /* Offline render: OFFLINE banner (with queued count) + the cached list below it.

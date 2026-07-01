@@ -225,10 +225,15 @@ static void replay_done(void *ctx, bool ok)
     (void)ctx;
     s_syncing = false;
     s_job = NULL;
-    if (!ok) {
-        return;   /* leave it queued; retry on the next reconnect (avoids hammering) */
+    if (ok) {
+        task_queue_pop_head(&s_queue);           /* replayed → drop it */
+    } else if (task_queue_fail_head(&s_queue)) {
+        ESP_LOGW(TAG, "dropping poison queue entry after %d tries", TASK_QUEUE_TRIES);
+        task_queue_pop_head(&s_queue);           /* poison → give up on it */
+    } else {
+        task_queue_save(&s_store, &s_queue);     /* persist the bumped try count */
+        return;                                  /* transient: retry next reconnect */
     }
-    task_queue_remove(&s_queue, 0);
     task_queue_save(&s_store, &s_queue);
     if (s_queue.n > 0) {
         drain_queue();   /* next queued close */
