@@ -57,8 +57,11 @@ static const app_cfg_field_t YAPP_CFG[] = {
 };
 TASKMASTER_REGISTER_APP_CONFIG(YAPP_NS, "Yapp", YAPP_CFG);
 
-static esp_http_client_handle_t s_client;
-static void fetch_abort(void *arg) { (void)arg; if (s_client) esp_http_client_close(s_client); }
+/* The HTTP client handle is worker-OWNED (a local in each *_work function), never a
+ * shared static: esp_http_client is not thread-safe, so the UI thread must never
+ * touch it. Cancel is cooperative — the worker polls async_job_cancelled() in its
+ * read loop and tears its own client down; exit() only sets the flag (§6A, step 13
+ * fix: the old cross-thread esp_http_client_close() abort crashed on Home-mid-fetch). */
 
 typedef struct {
     char   token[YAPP_TOKEN_MAX];
@@ -141,20 +144,21 @@ static bool fetch_work(async_job_t *job, void *ctx)
     f->ok = false;
 
     size_t heap0 = esp_get_free_heap_size();
-    s_client = todoist_client(YAPP_API_TASKS, f->token, HTTP_METHOD_GET);
-    async_job_on_cancel(job, fetch_abort, NULL);
+    esp_http_client_handle_t client = todoist_client(YAPP_API_TASKS, f->token, HTTP_METHOD_GET);
 
     char *body = malloc(YAPP_BODY_MAX);
-    if (body && esp_http_client_open(s_client, 0) == ESP_OK) {
-        esp_http_client_fetch_headers(s_client);
+    if (body && esp_http_client_open(client, 0) == ESP_OK) {
+        esp_http_client_fetch_headers(client);
         int total = 0, r;
-        while (total < YAPP_BODY_MAX - 1 &&
-               (r = esp_http_client_read(s_client, body + total, YAPP_BODY_MAX - 1 - total)) > 0) {
+        /* Poll the cancel flag each iteration so Home mid-fetch bails cooperatively
+         * (no cross-thread client teardown — that crashed, step 13 fix). */
+        while (total < YAPP_BODY_MAX - 1 && !async_job_cancelled(job) &&
+               (r = esp_http_client_read(client, body + total, YAPP_BODY_MAX - 1 - total)) > 0) {
             total += r;
         }
         body[total] = '\0';
-        int status = esp_http_client_get_status_code(s_client);
-        esp_http_client_close(s_client);
+        int status = esp_http_client_get_status_code(client);
+        esp_http_client_close(client);
         if (!async_job_cancelled(job) && status == 200 && total > 0) {
             f->ok = parse_todoist(body, f);
         } else {
@@ -162,8 +166,7 @@ static bool fetch_work(async_job_t *job, void *ctx)
         }
     }
     free(body);
-    esp_http_client_cleanup(s_client);
-    s_client = NULL;
+    esp_http_client_cleanup(client);
     ESP_LOGI(TAG, "fetch: ok=%d count=%d heap %u->%u (min %u)",
              f->ok, f->count, (unsigned)heap0, (unsigned)esp_get_free_heap_size(),
              (unsigned)esp_get_minimum_free_heap_size());
@@ -200,16 +203,15 @@ typedef struct { char token[YAPP_TOKEN_MAX]; char id[TASK_ID_MAX]; bool ok; } cl
 
 static bool close_work(async_job_t *job, void *ctx)
 {
+    (void)job;
     close_ctx_t *c = (close_ctx_t *)ctx;
     char url[sizeof(YAPP_API_TASKS) + TASK_ID_MAX + 8];
     snprintf(url, sizeof(url), "%s/%s/close", YAPP_API_TASKS, c->id);
-    s_client = todoist_client(url, c->token, HTTP_METHOD_POST);
-    async_job_on_cancel(job, fetch_abort, NULL);
-    esp_http_client_set_post_field(s_client, "", 0);
-    esp_err_t err = esp_http_client_perform(s_client);
-    int status = esp_http_client_get_status_code(s_client);
-    esp_http_client_cleanup(s_client);
-    s_client = NULL;
+    esp_http_client_handle_t client = todoist_client(url, c->token, HTTP_METHOD_POST);
+    esp_http_client_set_post_field(client, "", 0);
+    esp_err_t err = esp_http_client_perform(client);   /* bounded by timeout_ms */
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
     c->ok = (err == ESP_OK && status >= 200 && status < 300);
     ESP_LOGI(TAG, "close %s: ok=%d status=%d", c->id, c->ok, status);
     return c->ok;
