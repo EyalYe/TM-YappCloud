@@ -285,6 +285,8 @@ static bool desc_work(async_job_t *job, void *ctx)
             cJSON_Delete(root);
             d->ok = true;
         }
+        ESP_LOGI(TAG, "desc %s: status=%d len=%d desc_len=%d",
+                 d->id, status, total, (int)strlen(d->desc));
     }
     free(body);
     esp_http_client_cleanup(client);

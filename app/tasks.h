@@ -245,7 +245,7 @@ static inline void task_menu_row_text(int index, char *buf, int buf_sz, void *ct
 {
     (void)ctx;
     static const char *const labels[TASK_ACT_COUNT] = {
-        "View description", "Postpone", "Sync now", "Back",
+        "Details", "Postpone", "Sync now", "Back",
     };
     snprintf(buf, buf_sz, "%s", (index >= 0 && index < TASK_ACT_COUNT) ? labels[index] : "?");
 }
@@ -258,12 +258,20 @@ static inline void task_menu_render(task_detail_t *d, const task_view_t *v)
     ui_list_draw(&d->menu, TASK_MENU_FIRST_ROW, task_menu_row_text, NULL);
 }
 
-/* The description view: title + wrapped body (or Loading / empty state). */
+/* The task detail view: title + due date (from the cached task, no fetch) + the
+ * on-demand description (or Loading / empty state). */
 static inline void task_desc_render(task_detail_t *d, const task_view_t *v)
 {
     if (d->task < 0 || d->task >= v->count) return;
-    ui_text_row_scroll(TASK_MENU_TITLE_ROW, v->items[d->task].title);
-    if (d->desc_loading)    { ui_text_row(TASK_MENU_FIRST_ROW, "Loading..."); return; }
-    if (d->desc[0] == '\0') { ui_text_row(TASK_MENU_FIRST_ROW, "(no description)"); return; }
-    ui_text_wrap(TASK_MENU_FIRST_ROW, d->desc);
+    const task_t *t = &v->items[d->task];
+    ui_text_row_scroll(TASK_MENU_TITLE_ROW, t->title);
+
+    int row = TASK_MENU_FIRST_ROW;
+    char due[TASK_DUE_MAX + 8];
+    snprintf(due, sizeof(due), "Due: %s", t->due[0] ? t->due : "none");
+    ui_text_row(row++, due);
+
+    if (d->desc_loading)    { ui_text_row(row, "Loading..."); return; }
+    if (d->desc[0] == '\0') { ui_text_row(row, "(no description)"); return; }
+    ui_text_wrap(row, d->desc);
 }
