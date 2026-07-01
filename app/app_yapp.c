@@ -38,17 +38,22 @@ static const char *TAG = "app.yapp";
 #define YAPP_HTTP_TMO_MS  15000   /* HTTPS is slower than LAN */
 #define YAPP_API_TASKS    "https://api.todoist.com/api/v1/tasks"   /* unified v1 (rest/v2 retired) */
 
-static const control_hints_t YAPP_HINTS         = { .rotate = "<>", .click = "SYN", .select = "DON" };
-static const control_hints_t YAPP_HINTS_OFFLINE = { .rotate = "<>", .click = "OFF", .select = "DON" };
+/* LIST: click opens the detail submenu (§8.5 step-10 polish); Select one-tap Done.
+ * Offline click is disabled (submenu actions need the network). */
+static const control_hints_t YAPP_HINTS         = { .rotate = "<>", .click = "MNU", .select = "DON" };
+static const control_hints_t YAPP_HINTS_OFFLINE = { .rotate = "<>", .click = "---", .select = "DON" };
+static const control_hints_t YAPP_HINTS_MENU    = { .rotate = "<>", .click = "SEL", .select = "SEL" };
+static const control_hints_t YAPP_HINTS_DESC    = { .rotate = "  ", .click = "BAK", .select = "BAK" };
 
-static app_store_t  s_store;
-static char         s_token[YAPP_TOKEN_MAX];
-static task_view_t  s_view;
-static task_queue_t s_queue;     /* completes done offline, replayed on reconnect */
-static bool         s_syncing;
-static bool         s_error;
-static bool         s_online;    /* last-seen connectivity — to fire replay on reconnect */
-static async_job_t *s_job;
+static app_store_t   s_store;
+static char          s_token[YAPP_TOKEN_MAX];
+static task_view_t   s_view;
+static task_queue_t  s_queue;     /* completes done offline, replayed on reconnect */
+static task_detail_t s_detail;    /* per-task action submenu / description view */
+static bool          s_syncing;
+static bool          s_error;
+static bool          s_online;    /* last-seen connectivity — to fire replay on reconnect */
+static async_job_t  *s_job;
 
 /* App config (§9.4): the Todoist API token (paste field, masked). */
 static const app_cfg_field_t YAPP_CFG[] = {
@@ -219,6 +224,114 @@ static bool close_work(async_job_t *job, void *ctx)
 
 static void close_done(void *ctx, bool ok) { (void)ctx; (void)ok; s_syncing = false; s_job = NULL; do_sync(); }
 
+/* ── postpone: POST /tasks/{id} { "due_string":"tomorrow" } (detail submenu) ── */
+typedef struct { char token[YAPP_TOKEN_MAX]; char id[TASK_ID_MAX]; bool ok; } post_ctx_t;
+
+static bool postpone_work(async_job_t *job, void *ctx)
+{
+    (void)job;
+    post_ctx_t *p = (post_ctx_t *)ctx;
+    char url[sizeof(YAPP_API_TASKS) + TASK_ID_MAX + 2];
+    snprintf(url, sizeof(url), "%s/%s", YAPP_API_TASKS, p->id);
+    esp_http_client_handle_t client = todoist_client(url, p->token, HTTP_METHOD_POST);
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    static const char BODY[] = "{\"due_string\":\"tomorrow\"}";
+    esp_http_client_set_post_field(client, BODY, sizeof(BODY) - 1);
+    esp_err_t err = esp_http_client_perform(client);   /* bounded by timeout_ms */
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    p->ok = (err == ESP_OK && status >= 200 && status < 300);
+    ESP_LOGI(TAG, "postpone %s: ok=%d status=%d", p->id, p->ok, status);
+    return p->ok;
+}
+
+static void postpone_done(void *ctx, bool ok)
+{
+    (void)ctx; (void)ok;
+    s_syncing = false;
+    s_job = NULL;
+    s_detail.mode = TASK_VIEW_LIST;   /* back to the list, then confirm via re-sync */
+    do_sync();
+}
+
+/* ── view description: GET /tasks/{id} → "description" (on-demand, not stored) ── */
+typedef struct { char token[YAPP_TOKEN_MAX]; char id[TASK_ID_MAX]; char desc[TASK_DESC_MAX]; bool ok; } desc_ctx_t;
+
+static bool desc_work(async_job_t *job, void *ctx)
+{
+    desc_ctx_t *d = (desc_ctx_t *)ctx;
+    d->desc[0] = '\0';
+    d->ok = false;
+    char url[sizeof(YAPP_API_TASKS) + TASK_ID_MAX + 2];
+    snprintf(url, sizeof(url), "%s/%s", YAPP_API_TASKS, d->id);
+    esp_http_client_handle_t client = todoist_client(url, d->token, HTTP_METHOD_GET);
+    char *body = malloc(YAPP_BODY_MAX);
+    if (body && esp_http_client_open(client, 0) == ESP_OK) {
+        esp_http_client_fetch_headers(client);
+        int total = 0, r;
+        while (total < YAPP_BODY_MAX - 1 && !async_job_cancelled(job) &&
+               (r = esp_http_client_read(client, body + total, YAPP_BODY_MAX - 1 - total)) > 0) {
+            total += r;
+        }
+        body[total] = '\0';
+        int status = esp_http_client_get_status_code(client);
+        esp_http_client_close(client);
+        if (!async_job_cancelled(job) && status == 200 && total > 0) {
+            cJSON *root = cJSON_Parse(body);
+            cJSON *desc = cJSON_GetObjectItem(root, "description");
+            if (cJSON_IsString(desc) && desc->valuestring) {
+                strlcpy(d->desc, desc->valuestring, sizeof(d->desc));
+            }
+            cJSON_Delete(root);
+            d->ok = true;
+        }
+    }
+    free(body);
+    esp_http_client_cleanup(client);
+    return d->ok;
+}
+
+static void desc_done(void *ctx, bool ok)
+{
+    desc_ctx_t *d = (desc_ctx_t *)ctx;
+    s_syncing = false;
+    s_job = NULL;
+    s_detail.desc_loading = false;
+    if (ok) {
+        strlcpy(s_detail.desc, d->desc, sizeof(s_detail.desc));
+    }
+}
+
+/* Detail-submenu action submitters (online, one job at a time). */
+static void do_postpone(void)
+{
+    if (s_detail.task < 0 || s_detail.task >= s_view.count || s_syncing || !net_is_online()) {
+        return;
+    }
+    post_ctx_t p = {0};
+    strlcpy(p.token, s_token, sizeof(p.token));
+    strlcpy(p.id, s_view.items[s_detail.task].id, sizeof(p.id));
+    s_job = async_job_submit(postpone_work, postpone_done, &p, sizeof(p));
+    s_syncing = (s_job != NULL);
+}
+
+static void do_view_desc(void)
+{
+    if (s_detail.task < 0 || s_detail.task >= s_view.count || s_syncing || !net_is_online()) {
+        return;
+    }
+    desc_ctx_t d = {0};
+    strlcpy(d.token, s_token, sizeof(d.token));
+    strlcpy(d.id, s_view.items[s_detail.task].id, sizeof(d.id));
+    s_job = async_job_submit(desc_work, desc_done, &d, sizeof(d));
+    if (s_job) {
+        s_syncing = true;
+        s_detail.mode = TASK_VIEW_DESC;
+        s_detail.desc_loading = true;
+        s_detail.desc[0] = '\0';
+    }
+}
+
 /* ── offline write queue: replay queued completes on reconnect (§8.5 step 12) ── */
 static void drain_queue(void);
 
@@ -298,6 +411,7 @@ static void do_complete(void)
 static void yapp_init(void)
 {
     task_view_init(&s_view, UI_ROWS);
+    task_detail_reset(&s_detail);
     s_syncing = false;
     s_error = false;
     s_job = NULL;
@@ -315,10 +429,39 @@ static void yapp_init(void)
 
 static void yapp_on_event(uint8_t ev)
 {
+    /* Detail submenu (per-task actions) and description view take over input. */
+    if (s_detail.mode == TASK_VIEW_MENU) {
+        switch (ev) {
+        case EV_ENCODER_CW:  ui_list_move(&s_detail.menu, +1); break;
+        case EV_ENCODER_CCW: ui_list_move(&s_detail.menu, -1); break;
+        case EV_ENCODER_CLICK:
+        case EV_SELECT:
+            switch (ui_list_sel(&s_detail.menu)) {
+            case TASK_ACT_VIEW:     do_view_desc();                       break;
+            case TASK_ACT_POSTPONE: do_postpone();                        break;
+            case TASK_ACT_SYNC:     s_detail.mode = TASK_VIEW_LIST; do_sync(); break;
+            case TASK_ACT_BACK:     s_detail.mode = TASK_VIEW_LIST;        break;
+            default: break;
+            }
+            break;
+        default: break;
+        }
+        return;
+    }
+    if (s_detail.mode == TASK_VIEW_DESC) {
+        if (ev == EV_ENCODER_CLICK || ev == EV_SELECT) s_detail.mode = TASK_VIEW_MENU;
+        return;
+    }
+
     switch (ev) {
     case EV_ENCODER_CW:    task_view_move(&s_view, +1); break;
     case EV_ENCODER_CCW:   task_view_move(&s_view, -1); break;
-    case EV_ENCODER_CLICK: do_sync();                   break;
+    case EV_ENCODER_CLICK:
+        /* Open the per-task action submenu (online only — its actions need net). */
+        if (net_is_online() && s_view.count > 0 && !s_syncing) {
+            task_detail_open(&s_detail, task_view_sel(&s_view));
+        }
+        break;
     case EV_SELECT:        do_complete();               break;
     default: break;
     }
@@ -336,6 +479,19 @@ static void yapp_render(void)
         else               do_sync();
     }
     s_online = online;
+
+    /* Detail submenu / description view own the whole screen (set hints first so the
+     * content area is sized before drawing). */
+    if (s_detail.mode == TASK_VIEW_MENU) {
+        ui_frame_set_hints(&YAPP_HINTS_MENU);
+        task_menu_render(&s_detail, &s_view);
+        return;
+    }
+    if (s_detail.mode == TASK_VIEW_DESC) {
+        ui_frame_set_hints(&YAPP_HINTS_DESC);
+        task_desc_render(&s_detail, &s_view);
+        return;
+    }
 
     ui_frame_set_hints(online ? &YAPP_HINTS : &YAPP_HINTS_OFFLINE);
 
@@ -370,12 +526,26 @@ static void yapp_exit(void)
     app_store_close(&s_store);
 }
 
+/* Launcher visibility: hide Yapp until a Todoist token is configured (§8.5). Runs
+ * while the app is inactive, so read the token straight from our NVS namespace. */
+static bool yapp_available(void)
+{
+    app_store_t st;
+    char token[YAPP_TOKEN_MAX] = {0};
+    if (app_store_open(&st, YAPP_NS) == ESP_OK) {
+        app_store_get_str(&st, "token", token, sizeof(token), "");
+        app_store_close(&st);
+    }
+    return token[0] != '\0';
+}
+
 static const device_app_t yapp_app = {
-    .name     = "Yapp",
-    .init     = yapp_init,
-    .on_event = yapp_on_event,
-    .render   = yapp_render,
-    .exit     = yapp_exit,
+    .name      = "Yapp",
+    .init      = yapp_init,
+    .on_event  = yapp_on_event,
+    .render    = yapp_render,
+    .exit      = yapp_exit,
+    .available = yapp_available,
 };
 
 TASKMASTER_REGISTER_APP(yapp_app);

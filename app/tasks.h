@@ -198,3 +198,72 @@ static inline void task_view_render_offline(task_view_t *v, int queued)
     ui_list_set_rows(&v->list, UI_ROWS - TASK_BANNER_ROWS);   /* room for the banner */
     ui_list_draw(&v->list, TASK_BANNER_ROWS, task_row_text, v);
 }
+
+/* ── detail submenu (§8.5 step-10 polish): click a task → per-task actions ── */
+#define TASK_DESC_MAX        256   /* on-demand description buffer (fetched, not stored per task) */
+#define TASK_MENU_TITLE_ROW  0     /* the acted-on task's title */
+#define TASK_MENU_FIRST_ROW  1     /* action list / body below the title */
+
+enum {                             /* action rows, fixed order */
+    TASK_ACT_VIEW = 0,             /* View description (on-demand fetch) */
+    TASK_ACT_POSTPONE,             /* Postpone → tomorrow */
+    TASK_ACT_SYNC,                 /* Sync now */
+    TASK_ACT_BACK,                 /* back to the list */
+    TASK_ACT_COUNT
+};
+
+typedef enum { TASK_VIEW_LIST, TASK_VIEW_MENU, TASK_VIEW_DESC } task_mode_t;
+
+typedef struct {
+    task_mode_t mode;
+    int         task;                 /* index into view.items the menu acts on */
+    ui_list_t   menu;                 /* the action list */
+    char        desc[TASK_DESC_MAX];  /* fetched on demand */
+    bool        desc_loading;
+} task_detail_t;
+
+static inline void task_detail_reset(task_detail_t *d)
+{
+    d->mode = TASK_VIEW_LIST;
+    d->task = -1;
+    d->desc[0] = '\0';
+    d->desc_loading = false;
+}
+
+/* Enter the action submenu for task index `task`. */
+static inline void task_detail_open(task_detail_t *d, int task)
+{
+    d->mode = TASK_VIEW_MENU;
+    d->task = task;
+    d->desc[0] = '\0';
+    d->desc_loading = false;
+    ui_list_init(&d->menu, UI_ROWS - TASK_MENU_FIRST_ROW);
+    ui_list_set_count(&d->menu, TASK_ACT_COUNT);
+}
+
+static inline void task_menu_row_text(int index, char *buf, int buf_sz, void *ctx)
+{
+    (void)ctx;
+    static const char *const labels[TASK_ACT_COUNT] = {
+        "View description", "Postpone", "Sync now", "Back",
+    };
+    snprintf(buf, buf_sz, "%s", (index >= 0 && index < TASK_ACT_COUNT) ? labels[index] : "?");
+}
+
+/* The action submenu: the task title (scrolls) + the action list. */
+static inline void task_menu_render(task_detail_t *d, const task_view_t *v)
+{
+    if (d->task < 0 || d->task >= v->count) return;
+    ui_text_row_scroll(TASK_MENU_TITLE_ROW, v->items[d->task].title);
+    ui_list_draw(&d->menu, TASK_MENU_FIRST_ROW, task_menu_row_text, NULL);
+}
+
+/* The description view: title + wrapped body (or Loading / empty state). */
+static inline void task_desc_render(task_detail_t *d, const task_view_t *v)
+{
+    if (d->task < 0 || d->task >= v->count) return;
+    ui_text_row_scroll(TASK_MENU_TITLE_ROW, v->items[d->task].title);
+    if (d->desc_loading)    { ui_text_row(TASK_MENU_FIRST_ROW, "Loading..."); return; }
+    if (d->desc[0] == '\0') { ui_text_row(TASK_MENU_FIRST_ROW, "(no description)"); return; }
+    ui_text_wrap(TASK_MENU_FIRST_ROW, d->desc);
+}
